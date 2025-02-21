@@ -1,0 +1,11 @@
+[package]
+name = "hnsw"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+boxcar = "0.2.10"
+ordered-float = "5.0.0"
+parking_lot = "0.12.3"
+rand = "0.9.0"
+simsimd = "6.3.4"
