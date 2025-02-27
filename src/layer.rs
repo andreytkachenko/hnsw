@@ -1,38 +1,13 @@
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet},
+    f32,
     hash::{Hash, Hasher},
 };
 
 use ordered_float::OrderedFloat;
 
 use crate::index::Scalar;
-
-#[derive(Debug, Clone, Copy)]
-pub struct DistEntry<T>(pub OrderedFloat<f32>, pub T);
-
-impl<T: Eq> Eq for DistEntry<T> {}
-impl<T: PartialEq> PartialEq for DistEntry<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.1 == other.1
-    }
-}
-impl<T: PartialEq> PartialOrd for DistEntry<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.0.cmp(&other.0))
-    }
-}
-impl<T: Eq> Ord for DistEntry<T> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(&other.0)
-    }
-}
-
-impl<T: Hash> Hash for DistEntry<T> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.1.hash(state);
-    }
-}
 
 pub struct HnswLayer<S: Scalar> {
     /// Node Id to node index mapping
@@ -48,7 +23,7 @@ pub struct HnswLayer<S: Scalar> {
     pub node_connections: Vec<HashSet<DistEntry<usize>>>,
 
     /// Dimensions used as stride in calculation of subslice in node_vector
-    pub dimension: usize,
+    pub dimensions: usize,
 }
 
 impl<S: Scalar + std::fmt::Debug> HnswLayer<S> {
@@ -69,6 +44,7 @@ impl<S: Scalar + std::fmt::Debug> HnswLayer<S> {
             self.prune_connections(neighbour_id, m);
         }
 
+        self.nodes.insert(id, index);
         self.node_ids.push(id);
         self.node_connections.push(neighbours);
         self.node_vectors.extend_from_slice(vector);
@@ -83,12 +59,20 @@ impl<S: Scalar + std::fmt::Debug> HnswLayer<S> {
         ef: usize,
         debug: bool,
     ) -> impl Iterator<Item = DistEntry<usize>> {
-        let mut heap = BinaryHeap::with_capacity(ef);
+        let mut heap = BinaryHeap::with_capacity(ef + 1);
 
         if !self.node_ids.is_empty() {
-            let estimated_hops = self.node_ids.len().ilog2() as usize;
+            let mut last_minimal_dist = OrderedFloat(f32::INFINITY);
+            let mut minimal_dist = OrderedFloat(f32::INFINITY);
+            let mut minima_found = false;
+            let mut ef_countdown = ef as isize;
 
-            let mut visited = HashSet::with_capacity(estimated_hops * 4);
+            let estimated_hops = (self.node_ids.len() as f32)
+                .powf(1.0 / self.dimensions as f32)
+                .round() as usize
+                + ef;
+
+            let mut visited = HashSet::with_capacity(estimated_hops * ef * 4);
             let mut candidates = BinaryHeap::with_capacity(estimated_hops);
 
             visited.insert(entry);
@@ -107,6 +91,28 @@ impl<S: Scalar + std::fmt::Debug> HnswLayer<S> {
                 heap.push(candidate);
                 if heap.len() > ef {
                     heap.pop();
+
+                    if candidate.0 < minimal_dist {
+                        last_minimal_dist = minimal_dist;
+                        minimal_dist = candidate.0;
+                    } else {
+                        minima_found = true;
+                    }
+
+                    if debug {
+                        println!(
+                            "{} {} {} {} ",
+                            minima_found, last_minimal_dist, minimal_dist, ef_countdown
+                        );
+                    }
+
+                    if minima_found {
+                        if ef_countdown >= 0 {
+                            ef_countdown -= 1;
+                        } else {
+                            break;
+                        }
+                    }
                 }
 
                 for &DistEntry(_, neighbor) in &self.node_connections[candidate.1] {
@@ -131,9 +137,9 @@ impl<S: Scalar + std::fmt::Debug> HnswLayer<S> {
 
     #[inline]
     fn node_vector(&self, entry: usize) -> &[S] {
-        let offset = entry * self.dimension;
+        let offset = entry * self.dimensions;
 
-        &self.node_vectors[offset..offset + self.dimension]
+        &self.node_vectors[offset..offset + self.dimensions]
     }
 
     pub(crate) fn prune_connections(&mut self, node_idx: usize, m: usize) {
@@ -151,8 +157,8 @@ impl<S: Scalar + std::fmt::Debug> HnswLayer<S> {
     }
 
     pub(crate) fn create_connections(&mut self, node: usize, others: impl Iterator<Item = usize>) {
-        let offset = node * self.dimension;
-        let vector = &self.node_vectors[offset..offset + self.dimension];
+        let offset = node * self.dimensions;
+        let vector = &self.node_vectors[offset..offset + self.dimensions];
 
         for idx in others {
             let dist = self.dist_to(vector, idx);
@@ -169,7 +175,7 @@ impl<S: Scalar> HnswLayer<S> {
             node_ids: Vec::new(),
             node_vectors: Vec::new(),
             node_connections: Vec::new(),
-            dimension,
+            dimensions: dimension,
         }
     }
 }
