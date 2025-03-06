@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+arrayvec = "0.7.6"
 boxcar = "0.2.10"
+heapify = "0.2.0"
 leapfrog = {version = "0.3.1", features = ["stable_alloc"]}
+log = "0.4.26"
 ordered-float = "5.0.0"
 parking_lot = "0.12.3"
 rand = "0.9.0"

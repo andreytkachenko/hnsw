@@ -1,208 +1,250 @@
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet},
-    f32,
-    hash::{Hash, Hasher},
+    collections::{BinaryHeap, HashSet},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
+use arrayvec::ArrayVec;
+use boxcar as bc;
 use ordered_float::OrderedFloat;
+use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard};
 
-use crate::index::Scalar;
+use crate::{
+    heap::{DistanceCache as _, DistanceOrderedHeap, Heap, MappedHeap, Wrap},
+    index::HnswConfig,
+    DistEntry, Scalar, NODE_MAX_NEIGHBOURS,
+};
 
-pub struct HnswLayer<S: Scalar> {
-    /// Node Id to node index mapping
-    pub nodes: HashMap<u64, usize>,
-
-    /// Node Ids
-    pub node_ids: Vec<u64>,
-
-    /// Node vector slices strided by dimension
-    pub node_vectors: Vec<S>,
-
-    /// Node Connections with distace
-    pub node_connections: Vec<HashSet<DistEntry<usize>>>,
-
-    /// Dimensions used as stride in calculation of subslice in node_vector
-    pub dimensions: usize,
+#[derive(Debug)]
+pub struct HnswNode {
+    pub neighbours: RwLock<ArrayVec<u32, NODE_MAX_NEIGHBOURS>>,
+    pub delegate: AtomicU32,
 }
 
-impl<S: Scalar + std::fmt::Debug> HnswLayer<S> {
+pub struct HnswLayer<S: Scalar> {
+    pub ids: bc::Vec<u64>,
+
+    /// Layer level
+    pub level: u32,
+
+    /// Layer vectors data
+    pub vectors: RwLock<Vec<S>>,
+
+    /// HnswNode Collection indexes matched with vectors
+    pub nodes: bc::Vec<HnswNode>,
+
+    /// Node Index -> Id map
+    pub node_ids: bc::Vec<u64>,
+
+    /// Distance cache
+    dist_cache: leapfrog::LeapMap<(u32, u32), Wrap>,
+    dimensions: usize,
+
+    /// Number of connection
+    m: u32,
+}
+
+impl<S: Scalar> HnswLayer<S> {
+    pub fn new(level: u32, config: &HnswConfig) -> Self {
+        // estimated count nodes on the layer level: exp(level * ln(M)) same as 2^(level * log2(M))
+        let capacity = 1usize << (level * u32::ilog2(config.m));
+
+        Self {
+            ids: bc::Vec::with_capacity(capacity),
+            level,
+            vectors: RwLock::new(Vec::with_capacity(capacity * config.dimensions as usize)),
+            nodes: bc::Vec::with_capacity(capacity),
+            node_ids: bc::Vec::with_capacity(capacity),
+            dimensions: config.dimensions as _,
+            m: config.m,
+            dist_cache: leapfrog::LeapMap::with_capacity(capacity * config.m as usize),
+        }
+    }
+
     #[inline]
-    pub(crate) fn create_node(&mut self, id: u64, vector: &[S], ef: usize, m: usize) -> usize
-    where
-        S: Clone,
-    {
-        if self.nodes.contains_key(&id) {
-            panic!("node with id `{}` already exists!", id);
+    fn get_vector(&self, node: u32) -> MappedRwLockReadGuard<'_, [S]> {
+        RwLockReadGuard::map(self.vectors.read(), |x| {
+            let offset = node as usize * self.dimensions;
+
+            &x[offset..offset + self.dimensions]
+        })
+    }
+
+    #[inline]
+    pub fn create_node(&self, id: u64, vector: &[S], entrypoint: u32) -> u32 {
+        assert_eq!(vector.len(), self.dimensions);
+
+        let mut guard = self.vectors.write();
+        guard.extend_from_slice(vector);
+        self.ids.push(id);
+
+        let index = self.nodes.push(HnswNode {
+            neighbours: RwLock::new(ArrayVec::new()),
+            delegate: AtomicU32::new(0),
+        }) as u32;
+
+        drop(guard);
+
+        if self.nodes.count() > 1 {
+            let mut guard = self.nodes[index as usize].neighbours.write();
+
+            let mut heap = DistanceOrderedHeap::with_cache(
+                &mut *guard,
+                index,
+                &self.dist_cache,
+                |_, node| self.dist_to(vector, node).0.into_inner(),
+                Some(self.m),
+                None,
+            );
+
+            self.search_inner(vector, entrypoint, &mut heap, false);
+
+            for (id, dist) in heap.iter() {
+                self.dist_cache.put((index, id), dist);
+                self.node_add_connection(id, DistEntry(OrderedFloat(dist), index));
+            }
         }
-
-        let neighbours = self.search(vector, 0, ef, false).collect::<HashSet<_>>();
-        let index = self.node_ids.len();
-
-        for &DistEntry(dist, neighbour_id) in &neighbours {
-            self.node_connections[neighbour_id].insert(DistEntry(dist, index));
-            self.prune_connections(neighbour_id, m);
-        }
-
-        self.nodes.insert(id, index);
-        self.node_ids.push(id);
-        self.node_connections.push(neighbours);
-        self.node_vectors.extend_from_slice(vector);
 
         index
     }
 
-    pub(crate) fn search(
+    #[inline]
+    pub fn dist_to(&self, query: &[S], entry: u32) -> DistEntry<u32> {
+        DistEntry(
+            OrderedFloat(S::l2(query, &self.get_vector(entry)).unwrap() as f32),
+            entry,
+        )
+    }
+
+    pub fn dist_between(&self, node: u32, other: u32) -> DistEntry<u32> {
+        let lock = self.vectors.read();
+        let node_offset = node as usize * self.dimensions;
+        let other_offset = other as usize * self.dimensions;
+        let dist = S::l2(
+            &lock[node_offset..node_offset + self.dimensions],
+            &lock[other_offset..other_offset + self.dimensions],
+        )
+        .unwrap();
+
+        DistEntry(OrderedFloat(dist as f32), other)
+    }
+
+    pub(crate) fn search_inner(
         &self,
         query: &[S],
-        entry: usize,
-        ef: usize,
+        entrypoint: u32,
+        heap: &mut impl Heap<u32>,
         debug: bool,
-    ) -> impl Iterator<Item = DistEntry<usize>> {
-        let mut heap = BinaryHeap::with_capacity(ef + 1);
+    ) -> DistEntry<u32> {
+        log::debug!("layer #{} ({entrypoint}):", self.level);
+        log::debug!("layer node count: {:?}", self.nodes.count());
 
-        if !self.node_ids.is_empty() {
-            let mut last_minimal_dist = OrderedFloat(f32::INFINITY);
-            let mut minimal_dist = OrderedFloat(f32::INFINITY);
-            let mut minima_found = false;
-            let mut ef_countdown = ef as isize;
+        let mut visited = HashSet::new();
+        let mut candidates = BinaryHeap::new();
 
-            let estimated_hops = (self.node_ids.len() as f32)
-                .powf(1.0 / self.dimensions as f32)
-                .round() as usize
-                + ef;
+        let mut min_node = self.dist_to(query, entrypoint);
+        candidates.push(Reverse(min_node));
 
-            let mut visited = HashSet::with_capacity(estimated_hops * ef * 4);
-            let mut candidates = BinaryHeap::with_capacity(estimated_hops);
+        while let Some(Reverse(candidate)) = candidates.pop() {
+            if debug {
+                println!("#{} {}", candidate.1, candidate.0,);
+            }
 
-            visited.insert(entry);
-            candidates.push(Reverse(self.dist_to(query, entry)));
+            if candidate < min_node {
+                min_node = candidate;
+            }
 
-            while let Some(Reverse(candidate)) = candidates.pop() {
-                if debug {
-                    println!(
-                        "#{} {} {}",
-                        candidate.1,
-                        candidate.0,
-                        self.node_connections[candidate.1].len()
-                    );
+            if let Some(c) = heap.push(candidate) {
+                if c.0 <= candidate.0 {
+                    log::trace!("layer search exit");
+
+                    break;
                 }
+            }
 
-                heap.push(candidate);
-                if heap.len() > ef {
-                    heap.pop();
+            for &neighbor in self.nodes[candidate.1 as usize]
+                .neighbours
+                .read()
+                .as_slice()
+            {
+                if !visited.contains(&neighbor) {
+                    visited.insert(neighbor);
 
-                    if candidate.0 < minimal_dist {
-                        last_minimal_dist = minimal_dist;
-                        minimal_dist = candidate.0;
-                    } else {
-                        minima_found = true;
-                    }
-
-                    if debug {
-                        println!(
-                            "{} {} {} {} ",
-                            minima_found, last_minimal_dist, minimal_dist, ef_countdown
-                        );
-                    }
-
-                    if minima_found {
-                        if ef_countdown >= 0 {
-                            ef_countdown -= 1;
-                        } else {
-                            break;
-                        }
-                    }
-                }
-
-                for &DistEntry(_, neighbor) in &self.node_connections[candidate.1] {
-                    if !visited.contains(&neighbor) {
-                        visited.insert(neighbor);
-
-                        candidates.push(Reverse(self.dist_to(query, neighbor)));
-                    }
+                    candidates.push(Reverse(self.dist_to(query, neighbor)));
                 }
             }
         }
 
-        heap.into_iter()
+        min_node
+    }
+
+    pub fn search(&self, query: &[S], entrypoint: u32, heap: &mut impl Heap<u64>, debug: bool) {
+        let mut mapped_heap = MappedHeap::new(heap, |x| self.ids[x as usize]);
+        self.search_inner(query, entrypoint, &mut mapped_heap, debug);
+    }
+
+    fn node_add_connection(&self, entry: u32, neighbour: DistEntry<u32>) {
+        let mut guard = self.nodes[entry as usize].neighbours.write();
+        let mut heap = DistanceOrderedHeap::with_cache(
+            &mut *guard,
+            entry,
+            &self.dist_cache,
+            |_, node| self.dist_between(entry, node).0.into_inner(),
+            Some(self.m),
+            None,
+        );
+
+        heap.push(neighbour);
     }
 
     #[inline]
-    pub fn dist_to(&self, query: &[S], entry: usize) -> DistEntry<usize> {
-        let vec = self.node_vector(entry);
-
-        DistEntry(OrderedFloat(S::l2(query, vec).unwrap() as f32), entry)
+    pub(crate) fn _set_delegate(&self, node: u32, delegate: u32) {
+        self.nodes[node as usize]
+            .delegate
+            .store(delegate, Ordering::Relaxed)
     }
 
     #[inline]
-    fn node_vector(&self, entry: usize) -> &[S] {
-        let offset = entry * self.dimensions;
-
-        &self.node_vectors[offset..offset + self.dimensions]
-    }
-
-    pub(crate) fn prune_connections(&mut self, node_idx: usize, m: usize) {
-        let node_connections_len = self.node_connections[node_idx].len();
-        if node_connections_len <= m {
-            return;
-        }
-
-        let mut heap = BinaryHeap::from_iter(self.node_connections[node_idx].iter().cloned());
-        for _ in 0..node_connections_len - m {
-            if let Some(e) = heap.pop() {
-                self.node_connections[node_idx].remove(&e);
-            }
-        }
-    }
-
-    pub(crate) fn create_connections(&mut self, node: usize, others: impl Iterator<Item = usize>) {
-        let offset = node * self.dimensions;
-        let vector = &self.node_vectors[offset..offset + self.dimensions];
-
-        for idx in others {
-            let dist = self.dist_to(vector, idx);
-
-            self.node_connections[node].insert(dist);
-        }
-    }
-}
-
-impl<S: Scalar> HnswLayer<S> {
-    pub fn new(dimension: usize) -> Self {
-        Self {
-            nodes: HashMap::new(),
-            node_ids: Vec::new(),
-            node_vectors: Vec::new(),
-            node_connections: Vec::new(),
-            dimensions: dimension,
-        }
+    pub(crate) fn get_delegate(&self, node: u32) -> u32 {
+        self.nodes[node as usize].delegate.load(Ordering::Relaxed)
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
+    use std::f32;
 
-    use crate::layer::DistEntry;
+    use arrayvec::ArrayVec;
+
+    use crate::heap::DistanceOrderedHeap;
 
     use super::HnswLayer;
 
     #[test]
-    fn test_layer_search() {
-        let mut layer: HnswLayer<f32> = HnswLayer::new(2);
+    fn test_layer() {
+        let config = crate::index::HnswConfig {
+            estimate_count: 1024,
+            m: 4,
+            ef_construction: 4,
+            dimensions: 2,
+        };
+
+        let layer: HnswLayer<f32> = HnswLayer::new(0, &config);
 
         for i in 0..32 {
             for j in 0..32 {
-                layer.create_node(i * 32 + j, &[i as f32, j as f32], 8, 8);
+                layer.create_node(i * 32 + j, &[i as f32, j as f32], 0);
             }
         }
 
-        let mut res = layer
-            .search(&[31.5f32, 31.5f32], 0, 4, true)
-            .map(|DistEntry(_, id)| id)
-            .collect::<Vec<_>>();
+        let mut res: ArrayVec<u32, 4> = ArrayVec::new();
+        let mut heap = DistanceOrderedHeap::new(&mut res, 4, f32::INFINITY);
+
+        let best_one = layer.search_inner(&[31.5f32, 31.5f32], 0, &mut heap, false);
+
         res.sort();
 
-        assert_eq!(res, vec![990, 991, 1022, 1023]);
+        assert_eq!(best_one.1, 1023);
+        assert_eq!(res.as_slice(), &[990, 991, 1022, 1023]);
     }
 }
