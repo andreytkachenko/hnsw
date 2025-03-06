@@ -1,8 +1,16 @@
 use ordered_float::OrderedFloat;
 use std::hash::{Hash, Hasher};
 
+pub trait Scalar: simsimd::SpatialSimilarity + std::fmt::Debug + Copy + Clone + 'static {}
+impl<T: simsimd::SpatialSimilarity + std::fmt::Debug + Copy + Clone + 'static> Scalar for T {}
+
+mod heap;
 pub mod index;
-// pub mod layer;
+pub mod layer;
+
+pub(crate) const NODE_MAX_NEIGHBOURS: usize = 16;
+
+pub trait DistCache {}
 
 #[derive(Debug, Clone, Copy)]
 pub struct DistEntry<T>(pub OrderedFloat<f32>, pub T);

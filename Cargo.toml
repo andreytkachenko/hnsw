@@ -1,12 +1,25 @@
 [package]
-name = "hnsw"
+name = "vsearch"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+keywords = ["search", "vector-search", "hnsw", "embeddings"]
+description = "HNSW based vector search index"
+license = " MIT OR Apache-2.0"
+
+[[bench]]
+name = "index_benchmark"
+harness = false
 
 [dependencies]
+arrayvec = "0.7.6"
 boxcar = "0.2.10"
-leapfrog = {version = "0.3.1", features = ["stable_alloc"]}
+heapify = "0.2.0"
+leapfrog = { version = "0.3.1", features = ["stable_alloc"] }
+log = "0.4.26"
 ordered-float = "5.0.0"
 parking_lot = "0.12.3"
 rand = "0.9.0"
 simsimd = "6.3.4"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
