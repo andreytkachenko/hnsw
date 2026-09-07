@@ -4,6 +4,33 @@ use std::hash::{Hash, Hasher};
 pub trait Scalar: simsimd::SpatialSimilarity + std::fmt::Debug + Copy + Clone + 'static {}
 impl<T: simsimd::SpatialSimilarity + std::fmt::Debug + Copy + Clone + 'static> Scalar for T {}
 
+/// Custom distance metric over flat vectors.
+///
+/// `HnswIndex` navigates and ranks candidates with this metric, so implement it
+/// to match the distance you want to search in (it should be a proper metric
+/// for best navigation quality).
+pub trait Distance<S: Scalar>: Send + Sync + Clone + Default {
+    fn distance(&self, a: &[S], b: &[S]) -> f64;
+}
+
+#[derive(Default, Clone)]
+pub struct Euclidian;
+impl<S: Scalar> Distance<S> for Euclidian {
+    #[inline]
+    fn distance(&self, a: &[S], b: &[S]) -> f64 {
+        S::euclidean(a, b).unwrap()
+    }
+}
+
+#[derive(Default, Clone)]
+pub struct Cosine;
+impl<S: Scalar> Distance<S> for Cosine {
+    #[inline]
+    fn distance(&self, a: &[S], b: &[S]) -> f64 {
+        S::cosine(a, b).unwrap()
+    }
+}
+
 mod heap;
 pub mod index;
 pub mod layer;
