@@ -2,15 +2,19 @@ use core::f32;
 use criterion::{Criterion, criterion_group, criterion_main};
 use rand::Rng;
 use std::hint::black_box;
-use vsearch::index::HnswIndex;
+use vsearch::{Euclidian, index::HnswIndex};
 
-fn index_create(data: &[f32], n: usize) -> HnswIndex<f32> {
-    let index = HnswIndex::new(vsearch::index::HnswConfig {
-        estimate_count: n as _,
-        m: 16,
-        ef_construction: 16,
-        dimensions: 128,
-    });
+fn index_create(data: &[f32], n: usize) -> HnswIndex<f32, Euclidian> {
+    let index = HnswIndex::new(
+        vsearch::index::HnswConfig {
+            estimate_count: n as _,
+            m: 16,
+            ef_construction: 16,
+            dimensions: 128,
+            ef_search: 32,
+        },
+        Euclidian,
+    );
 
     for idx in 0..n {
         let offset = idx * 128;

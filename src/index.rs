@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{
-    Scalar,
+    Distance, Scalar,
     heap::{DistanceOrderedHeap, MinEntryHeap},
     layer::HnswLayer,
 };
@@ -21,65 +21,66 @@ pub struct HnswConfig {
 
     /// Dimensions used as stride in calculation of subslice in node_vector
     pub dimensions: u32,
+
+    /// Search beam width (ef_search); the query explores at least this many candidates
+    pub ef_search: u32,
 }
 
-pub struct HnswIndex<S: Scalar> {
-    pub(crate) layers: bc::Vec<HnswLayer<S>>,
+pub struct HnswIndex<S: Scalar, D: Distance<S>> {
+    pub(crate) layers: bc::Vec<HnswLayer<S, D>>,
     pub(crate) config: HnswConfig,
     total_nodes: AtomicUsize,
 
     // Cached value of 1 / ln(M)
     ml: f64,
+
+    // Distance metric
+    mt: D,
 }
 
-impl<S: Scalar> HnswIndex<S> {
-    pub fn new(config: HnswConfig) -> Self {
+impl<S: Scalar, D: Distance<S>> HnswIndex<S, D> {
+    pub fn new(config: HnswConfig, mt: D) -> Self {
         Self {
-            layers: bc::vec![HnswLayer::new(0, &config)],
+            layers: bc::vec![HnswLayer::new(0, &config, mt.clone())],
             ml: 1.0 / (config.m as f64).ln(),
             config,
             total_nodes: AtomicUsize::new(0),
+            mt,
         }
     }
 
+    /// Insert a node into the index.
+    ///
+    /// The node is placed in every layer `0..=node_level` (standard HNSW), so it
+    /// stays reachable while traversing any lower layer.
     pub fn insert<V: AsRef<[S]>>(&self, id: u64, vector: V) {
-        println!("insert {id}");
-
         let vector = vector.as_ref();
         let node_level = self.pick_node_level();
-        let mut delegate = 0;
-        let mut node_closest = 0;
-        if !self.layers[node_level as usize].is_empty() {
-            let mut noop = MinEntryHeap::default();
-            println!("node_level: {node_level}");
 
-            let delegate_level = node_level as i32 - 1;
-            println!("delegate_level: {delegate_level}");
-
-            let mut entrypoint = 0;
-            for level in (node_level.saturating_sub(1)..self.layers.count() as u32).rev() {
-                let layer = &self.layers[level as usize];
-                let best_one = layer.search_inner(vector, entrypoint, &mut noop, true);
-
-                println!(
-                    "lvl {level}: {} {}",
-                    layer.ids.get(best_one.1 as usize).unwrap(),
-                    best_one.0
-                );
-
-                if level == node_level {
-                    node_closest = best_one.1;
+        // Greedy descent (ef = 1) from the topmost layer down to `node_level + 1`:
+        // the closest node found at each layer becomes the entry point for the next one.
+        let mut ep_ext: Option<u64> = None;
+        if self.total_nodes.load(Ordering::Relaxed) > 0 {
+            for lc in (node_level as usize + 1)..self.layers.count() {
+                let layer = &self.layers[lc];
+                if layer.is_empty() {
+                    continue;
                 }
 
-                if level as i32 == delegate_level {
-                    delegate = best_one.1;
-                }
-
-                entrypoint = layer.get_delegate(best_one.1);
+                let entrypoint = ep_ext.and_then(|ext| layer.find(ext)).unwrap_or(0);
+                let mut scratch = MinEntryHeap::default();
+                let best_one = layer.search_inner(vector, entrypoint, &mut scratch, 1, false);
+                ep_ext = Some(layer.ids[best_one.1 as usize]);
             }
         }
 
-        self.layers[node_level as usize].create_node(id, vector, node_closest, delegate);
+        // Create the node in all layers it belongs to, top-down.
+        for lc in (0..=node_level as usize).rev() {
+            let layer = &self.layers[lc];
+            let entrypoint = ep_ext.and_then(|ext| layer.find(ext)).unwrap_or(0);
+            layer.create_node(id, vector, entrypoint);
+        }
+
         self.total_nodes.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -89,20 +90,45 @@ impl<S: Scalar> HnswIndex<S> {
         }
     }
 
-    pub fn search(&self, query: &[S], k: u32, max_dist: f32) -> impl Iterator<Item = (u64, f32)> {
-        let mut res = Vec::new();
-        let mut heap = DistanceOrderedHeap::new(&mut res, k, max_dist);
-
-        let mut entrpoint = 0;
-        for level in (0..self.layers.count()).rev() {
-            let layer = &self.layers[level];
-            let best_one = layer.search_inner(query, entrpoint, &mut heap, false);
-
-            entrpoint = layer.get_delegate(best_one.1);
+    /// Search for the `k` nearest items within `max_dist`.
+    ///
+    /// Returns `(external_id, distance)` pairs sorted by distance ascending.
+    pub fn search(&self, query: &[S], k: u32, max_dist: f32) -> Vec<(u64, f32)> {
+        if self.total_nodes.load(Ordering::Relaxed) == 0 {
+            return Vec::new();
         }
 
-        std::iter::zip(heap.into_inner(), res) //
-            .map(|(dist, idx)| (idx as u64, dist.into_inner()))
+        let ef = self.config.ef_search.max(k).max(1);
+
+        // Greedy descent (ef = 1) from the topmost layer down to layer 1.
+        let mut ep_ext: Option<u64> = None;
+        for lc in (1..self.layers.count()).rev() {
+            let layer = &self.layers[lc];
+            if layer.is_empty() {
+                continue;
+            }
+
+            let entrypoint = ep_ext.and_then(|ext| layer.find(ext)).unwrap_or(0);
+            let mut scratch = MinEntryHeap::default();
+            let best_one = layer.search_inner(query, entrypoint, &mut scratch, 1, false);
+            ep_ext = Some(layer.ids[best_one.1 as usize]);
+        }
+
+        // Full search at layer 0 with the query beam width.
+        let layer0 = &self.layers[0];
+        let entrypoint = ep_ext.and_then(|ext| layer0.find(ext)).unwrap_or(0);
+
+        let mut res = Vec::new();
+        let mut heap = DistanceOrderedHeap::new(&mut res, k, max_dist);
+        layer0.search_inner(query, entrypoint, &mut heap, ef, false);
+
+        // `res` holds internal node indices of layer 0; translate to external ids.
+        let mut out: Vec<(u64, f32)> = std::iter::zip(heap.into_inner(), res)
+            .map(|(dist, idx)| (layer0.ids[idx as usize], dist.into_inner()))
+            .collect();
+
+        out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        out
     }
 
     /// pick_node_level picks the level at which a new node should be inserted
@@ -118,9 +144,9 @@ impl<S: Scalar> HnswIndex<S> {
         }
 
         if self.layers.get(level as usize).is_none() {
-            println!("ADD LAYER: {}", self.layers.count());
+            log::debug!("ADD LAYER: {}", self.layers.count());
 
-            self.layers.push(HnswLayer::new(level, &self.config));
+            self.layers.push(HnswLayer::new(level, &self.config, self.mt.clone()));
         }
 
         level
@@ -129,11 +155,8 @@ impl<S: Scalar> HnswIndex<S> {
 
 #[cfg(test)]
 mod test {
-    use core::f32;
-
-    use arrayvec::ArrayVec;
-
     use crate::index::HnswIndex;
+    use crate::Euclidian;
 
     #[test]
     fn test_index() {
@@ -142,9 +165,10 @@ mod test {
             m: 4,
             ef_construction: 4,
             dimensions: 2,
+            ef_search: 32,
         };
 
-        let index: HnswIndex<f32> = HnswIndex::new(config);
+        let index: HnswIndex<f32, Euclidian> = HnswIndex::new(config, Euclidian);
 
         for i in 0..32 {
             for j in 0..32 {
@@ -152,23 +176,64 @@ mod test {
             }
         }
 
-        println!("insertion done");
+        let res = index.search(&[31.5f32, 31.5f32], 4, f32::INFINITY);
 
-        for (_, layer) in &index.layers {
-            println!("{} {}", layer.level, layer.nodes.count());
-            println!("{:?}", layer.ids);
-            println!()
+        assert_eq!(res.len(), 4);
+        let ids: Vec<u64> = res.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&990), "ids: {ids:?}");
+        assert!(ids.contains(&991), "ids: {ids:?}");
+        assert!(ids.contains(&1022), "ids: {ids:?}");
+        assert!(ids.contains(&1023), "ids: {ids:?}");
+
+        // results must be sorted by distance ascending
+        for w in res.windows(2) {
+            assert!(w[0].1 <= w[1].1);
+        }
+    }
+
+    #[test]
+    fn test_search_empty() {
+        let config = crate::index::HnswConfig {
+            estimate_count: 64,
+            m: 4,
+            ef_construction: 4,
+            dimensions: 2,
+            ef_search: 16,
+        };
+
+        let index: HnswIndex<f32, Euclidian> = HnswIndex::new(config, Euclidian);
+        assert!(index.search(&[0.0f32, 0.0], 4, f32::INFINITY).is_empty());
+    }
+
+    #[test]
+    fn test_search_returns_true_nearest_1d() {
+        let config = crate::index::HnswConfig {
+            estimate_count: 64,
+            m: 8,
+            ef_construction: 16,
+            dimensions: 1,
+            ef_search: 32,
+        };
+
+        let index: HnswIndex<f32, Euclidian> = HnswIndex::new(config, Euclidian);
+        for i in 0..20u64 {
+            index.insert(i, [i as f32]);
         }
 
-        let mut res: ArrayVec<_, 4> = index
-            .search(&[31.5f32, 31.5f32], 4, f32::INFINITY)
-            .collect();
+        // query 10.5: true nearest are 10, 11 (dist 0.5), then 9, 12 (dist 1.5)
+        let res = index.search(&[10.5f32], 3, f32::INFINITY);
+        let ids: Vec<u64> = res.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&10), "ids: {ids:?}");
+        assert!(ids.contains(&11), "ids: {ids:?}");
+        for (_, d) in &res {
+            assert!(*d <= 1.5 + f32::EPSILON);
+        }
 
-        res.sort_by_key(|(id, _)| *id);
-
-        assert_eq!(res[0].0, 990);
-        assert_eq!(res[1].0, 991);
-        assert_eq!(res[2].0, 1022);
-        assert_eq!(res[3].0, 1023);
+        // query 0.0: true nearest are 0, 1, 2
+        let res = index.search(&[0.0f32], 3, f32::INFINITY);
+        let ids: Vec<u64> = res.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&0), "ids: {ids:?}");
+        assert!(ids.contains(&1), "ids: {ids:?}");
+        assert!(ids.contains(&2), "ids: {ids:?}");
     }
 }
